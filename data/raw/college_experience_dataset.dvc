@@ -1,0 +1,6 @@
+outs:
+- md5: 0f0fa000112426051e952ccdeae0ca77.dir
+  size: 2759192661
+  nfiles: 267
+  hash: md5
+  path: college_experience_dataset

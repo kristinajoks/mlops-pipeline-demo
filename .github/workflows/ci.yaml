@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up conda environment
+        uses: conda-incubator/setup-miniconda@v2
+        with:
+          python-version: "3.12"
+          environment-file: environment.yml
+          activate-environment: mlops-pipeline-demo
+          auto-activate-base: false
+          auto-update-conda: true
+          channels: conda-forge,defaults
+
+      - name: Show environment info
+        run: |
+          conda info
+          conda list
+
+      - name: Run tests
+        run: pytest tests/ --tb=short -v
