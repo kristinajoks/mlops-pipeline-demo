@@ -223,15 +223,7 @@ data/predictions/*
 !data/predictions/.gitkeep
 
 !data/raw/*.dvc
-
-# Outputs
-outputs/figures/*
-outputs/tables/*
-outputs/reports/*
-
-!outputs/figures/.gitkeep
-!outputs/tables/.gitkeep
-!outputs/reports/.gitkeep
+!data/processed/**/*.dvc
 
 # Temporary / caches
 tmp/
@@ -245,6 +237,9 @@ mlartifacts/
 # DVC cache
 .dvc/cache/
 .dvc/tmp/
+
+# Great Expectations
+great_expectations/uncommitted/
 
 # Model files 
 *.pkl

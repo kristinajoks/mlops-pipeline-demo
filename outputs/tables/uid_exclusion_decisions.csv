@@ -1,0 +1,6 @@
+uid,in_ema,in_covid,in_sensing,in_demo,total_rows,surveys,span_days,reason
+8617ddac1f48b148e3683738519b2e7a,True,True,True,False,1269,155,1269,not_in_demographics
+ad15fc229da933fbf1fc0f92fc9b55a3,True,False,True,True,2,1,2,very_few_surveys_1
+df5e798581def8d477316520953b9171,True,False,True,False,2,0,2,not_in_demographics
+e6d71fe4a3c10b075ae1cf51a2fe6cfd,True,False,True,False,4,0,4,not_in_demographics
+ea716dd032aaa0dcf8bfa36b1811917f,True,False,True,False,50,9,50,not_in_demographics
