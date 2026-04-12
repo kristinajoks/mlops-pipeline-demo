@@ -1,0 +1,5 @@
+outs:
+- md5: c0a125b843acb058fecf5bf63c355a19
+  size: 1700332
+  hash: md5
+  path: covid_weekly.csv
