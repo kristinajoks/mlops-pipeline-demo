@@ -32,3 +32,13 @@ def impute_for_ridge(df: pd.DataFrame, features: list,
         if col in df.columns:
             df[col] = df[col].fillna(median)
     return df, medians
+
+# Adds previous-week label as a feature 
+# Rows with no previous week get NaN.
+def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.sort_values(["uid", "year_week"]).reset_index(drop=True)
+    df["label_lag1"] = (
+        df.groupby("uid")["label_composite_score"].shift(1)
+    )
+    return df

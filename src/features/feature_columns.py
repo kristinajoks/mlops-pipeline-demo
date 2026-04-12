@@ -1,4 +1,5 @@
 SENSING_FEATURES = [
+    "label_lag1",
     "sleep_duration_mean",             "sleep_duration_std",
     "unlock_num_ep_0_mean",            "unlock_num_ep_0_std",
     "unlock_duration_ep_0_mean",       "unlock_duration_ep_0_std",
