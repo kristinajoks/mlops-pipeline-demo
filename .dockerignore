@@ -1,0 +1,12 @@
+data/
+mlruns/
+mlartifacts/
+mlflow.db
+notebooks/
+outputs/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.dvc/
