@@ -1,4 +1,4 @@
 model,period,features,n_features,test_mae,test_r2
 v1_pre_covid,2019-W46/2020-W11,sensing_only,22,10.5936,0.3058
-v1_covid_period,2021-W07/2021-W26,sensing_only,22,10.131918698993601,0.35043936097716855
+v1_covid_period,2021-W07/2021-W26,sensing_only,22,10.16196414331766,0.34416157982692697
 v2_covid_period,2021-W07/2021-W26,sensing_plus_covid,32,9.47478500315469,0.4481429352564046
