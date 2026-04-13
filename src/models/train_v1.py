@@ -1,5 +1,5 @@
 """
-v1 training pipeline — Ridge baseline and LightGBM.
+v1 training pipeline - Ridge baseline and LightGBM.
 """
 
 from xml.parsers.expat import model
@@ -44,7 +44,7 @@ def fix_android_nan(X: pd.DataFrame) -> pd.DataFrame:
             X.loc[android_mask, col] = X.loc[android_mask, col].fillna(0)
     return X
 
-# Runs prediction and returns MAE and R2.
+# Runs prediction and returns MAE and R2
 def evaluate(model, X, y, scaler=None):
     X_input = apply_scaler(X, scaler) if scaler else X
     preds = model.predict(X_input)
@@ -53,7 +53,7 @@ def evaluate(model, X, y, scaler=None):
         "r2":  round(float(r2_score(y, preds)), 4),
     }
 
-# Trains Ridge regression baseline on v1 sensing features.
+# Trains Ridge regression baseline on v1 sensing features
 def train_ridge(alpha: float = 1.0, run_name: str = "v1_ridge_baseline"):
     train, val, test = load_v1_splits()
 
