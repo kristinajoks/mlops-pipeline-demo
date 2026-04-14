@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlops-config
+  namespace: default
+data:
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+  MODEL_NAME: "mental_health_v1"
+  MODEL_ALIAS: "production"
+  PROMETHEUS_MULTIPROC_DIR: "/tmp/prometheus_multiproc"

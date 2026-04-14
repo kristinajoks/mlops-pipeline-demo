@@ -31,6 +31,7 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: ${MODEL_NAME}
       MODEL_ALIAS: ${MODEL_ALIAS}
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus_multiproc
     depends_on:
       mlflow:
         condition: service_healthy

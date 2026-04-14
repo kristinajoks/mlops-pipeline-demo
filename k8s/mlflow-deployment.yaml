@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+        - name: mlflow
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - >
+              pip install -q mlflow &&
+              cd /mlflow &&
+              mlflow server --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root file:///mlflow/mlartifacts --host 0.0.0.0 --port 5000 --serve-artifacts --allowed-hosts mlflow-service,mlflow-service:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000
+          ports:
+            - containerPort: 5000
+          volumeMounts:
+            - name: mlflow-data
+              mountPath: /mlflow
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5000
+              httpHeaders:
+                - name: Host
+                  value: localhost:5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+      volumes:
+        - name: mlflow-data
+          hostPath:
+            path: /mlflow-data
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-service
+  namespace: default
+spec:
+  selector:
+    app: mlflow
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP
