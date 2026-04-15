@@ -12,6 +12,7 @@ Tasks:
 """
 
 from datetime import datetime, timedelta
+import os
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.operators.empty import EmptyOperator
@@ -21,10 +22,10 @@ import sys
 from pathlib import Path
 
 # Ensure src/ is importable from DAG context
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", "/opt/project"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
-MLFLOW_TRACKING_URI = "http://localhost:5000"
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 EXPERIMENT_NAME     = "mental_health_prediction"
 MODEL_NAME          = "mental_health_v1"
 
@@ -225,7 +226,6 @@ def register_v1_fn(**context):
     print(f"Registered: {MODEL_NAME} v{registered.version} @production")
     print(f"  val_mae : {val_mae:.4f}")
     print(f"  run_id  : {run_id}")
-
 
 # Tasks
 

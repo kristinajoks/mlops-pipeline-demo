@@ -8,20 +8,21 @@ Tasks:
   2. load_inference_data     - Load the week's sensing data
   3. run_inference           - POST to inference API for each student
   4. store_predictions       - Write predictions to outputs/predictions/
-  5. check_ground_truth      - If labels available (1-week delay), log MAE
 """
 
 from datetime import datetime, timedelta
+import os
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 import sys
 from pathlib import Path
+import os
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", "/opt/project"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
-INFERENCE_API_URL   = "http://localhost:8000"
-MLFLOW_TRACKING_URI = "http://localhost:5000"
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+INFERENCE_API_URL   = os.getenv("INFERENCE_API_URL", "http://localhost:8000")   
 EXPERIMENT_NAME     = "mental_health_prediction"
 
 default_args = {
@@ -98,13 +99,9 @@ def load_inference_data_fn(**context):
 
 
 # Run inference 
+# Calls inference API (Kubernetes minikube service URL or localhost:8000 in docker-compose)
+# for each student in the week, stores predictions to XCom
 def run_inference_fn(**context):
-    """
-    Calls the inference API for each student in the week.
-    The API runs inside Kubernetes — accessed via minikube service URL
-    or localhost:8000 in docker-compose mode.
-    Stores predictions to XCom for downstream tasks.
-    """
     import requests
     import json
     import pandas as pd
@@ -126,7 +123,7 @@ def run_inference_fn(**context):
     for record in records:
         uid = record["uid"]
 
-        # Build feature payload — only SENSING_FEATURES
+        # SENSING_FEATURES
         features = {
             col: record.get(col)
             for col in SENSING_FEATURES
@@ -164,14 +161,8 @@ def run_inference_fn(**context):
     ti.xcom_push(key="n_errors", value=len(errors))
 
 
-# ── Task 4: Store predictions ──────────────────────────────────────────────────
-
+# Store predictions to outputs/predictions/<year_week>.csv
 def store_predictions_fn(**context):
-    """
-    Writes predictions to outputs/predictions/<year_week>.csv
-    This is the prediction store — the monitoring pipeline reads
-    from here to compare predictions against arrived ground truth.
-    """
     import json
     import pandas as pd
 
@@ -194,70 +185,7 @@ def store_predictions_fn(**context):
 
     print(f"Stored {len(df)} predictions to {out_path}")
 
-
-# ── Task 5: Check ground truth if available ────────────────────────────────────
-
-def check_ground_truth_fn(**context):
-    """
-    Checks if ground truth labels have arrived for the prediction week.
-    Labels arrive one week after the EMA survey (W+1 delay).
-    If available, computes MAE and logs to MLflow as a metric.
-    This feeds the rolling MAE that Prometheus monitors.
-    """
-    import json
-    import pandas as pd
-    import mlflow
-    from sklearn.metrics import mean_absolute_error
-
-    ti = context["ti"]
-    year_week = ti.xcom_pull(task_ids="validate_new_sensing", key="year_week")
-    predictions_json = ti.xcom_pull(task_ids="run_inference", key="predictions")
-
-    if not predictions_json:
-        return
-
-    predictions = json.loads(predictions_json)
-    pred_df = pd.DataFrame(predictions)
-
-    # Load labels — inference_v1 contains label_composite_score
-    SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
-    inference_data = pd.read_csv(SPLITS_DIR / "inference_v1.csv")
-    labels = inference_data[inference_data["year_week"] == year_week][
-        ["uid", "label_composite_score"]
-    ]
-
-    if labels.empty:
-        print(f"No ground truth available for {year_week} yet.")
-        return
-
-    # Merge predictions with labels
-    merged = pred_df.merge(labels, on="uid", how="inner")
-    if merged.empty:
-        print("No matching students between predictions and labels.")
-        return
-
-    mae = mean_absolute_error(
-        merged["label_composite_score"],
-        merged["predicted_score"]
-    )
-
-    print(f"Ground truth available for {year_week}:")
-    print(f"  Matched students : {len(merged)}")
-    print(f"  Weekly MAE       : {mae:.4f}")
-
-    # Log to MLflow for Prometheus to track
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(EXPERIMENT_NAME)
-    with mlflow.start_run(run_name=f"inference_{year_week}"):
-        mlflow.log_metric("weekly_mae", mae)
-        mlflow.log_metric("n_predictions", len(merged))
-        mlflow.set_tag("year_week", year_week)
-        mlflow.set_tag("pipeline", "inference")
-
-    print(f"Logged weekly_mae={mae:.4f} to MLflow for {year_week}.")
-
-
-# ── Define tasks ──────────────────────────────────────────────────────────────
+# Tasks
 
 t1_validate = PythonOperator(
     task_id="validate_new_sensing",
@@ -283,12 +211,5 @@ t4_store = PythonOperator(
     dag=dag,
 )
 
-t5_gt = PythonOperator(
-    task_id="check_ground_truth",
-    python_callable=check_ground_truth_fn,
-    dag=dag,
-)
-
-# ── Dependencies ──────────────────────────────────────────────────────────────
-
-t1_validate >> t2_load >> t3_infer >> t4_store >> t5_gt
+# Dependencies 
+t1_validate >> t2_load >> t3_infer >> t4_store 

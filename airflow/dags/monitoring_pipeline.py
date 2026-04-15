@@ -18,27 +18,32 @@ Tasks:
   7. notify                  - Log outcome to MLflow
 
 The key architectural point: task 4 calls train_v2.train_lightgbm_v2
-with register=True — this is the ONLY place v2 gets registered.
+with register=True - this is the ONLY place v2 gets registered.
 The MLflow audit trail shows this run was triggered by the monitoring
 DAG, not by a human. This is what makes the demonstration authentic.
 """
 
 from datetime import datetime, timedelta
+import os
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.operators.empty import EmptyOperator
 import sys
 from pathlib import Path
+import numpy as np
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", "/opt/project"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
-MLFLOW_TRACKING_URI    = "http://localhost:5000"
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 EXPERIMENT_NAME        = "mental_health_prediction"
 V1_MODEL_NAME          = "mental_health_v1"
 V2_MODEL_NAME          = "mental_health_v2"
 ROLLING_WINDOW_WEEKS   = 8
 MAE_THRESHOLD_FACTOR   = 1.3   # Alert if rolling MAE > 1.3x training MAE
+PSI_MODERATE_THRESHOLD = 0.2
+PSI_SEVERE_THRESHOLD = 0.25
+MIN_DRIFTED_FEATURES = 3
 
 default_args = {
     "owner":            "mlops",
@@ -51,30 +56,61 @@ dag = DAG(
     dag_id="monitoring_pipeline",
     description="Drift detection and automated v2 retraining",
     default_args=default_args,
-    start_date=datetime(2024, 1, 1),
+    start_date=datetime(2020, 1, 1),
     schedule=None,      # Triggered by Prometheus alert or manual run
     catchup=False,
     tags=["monitoring", "retraining", "v2", "drift"],
 )
 
+def _compute_psi(reference, current, bins=10):
+    import numpy as np
+    import pandas as pd
 
-# ── Task 1: Collect ground truth ───────────────────────────────────────────────
+    ref = pd.Series(reference).replace([np.inf, -np.inf], np.nan).dropna()
+    cur = pd.Series(current).replace([np.inf, -np.inf], np.nan).dropna()
 
+    if len(ref) == 0 or len(cur) == 0:
+        return 0.0
+
+    # If constant feature, no meaningful PSI
+    if ref.nunique() <= 1 and cur.nunique() <= 1:
+        return 0.0
+
+    try:
+        breakpoints = np.unique(
+            np.nanpercentile(ref, np.linspace(0, 100, bins + 1))
+        )
+        if len(breakpoints) < 3:
+            return 0.0
+
+        ref_counts, _ = np.histogram(ref, bins=breakpoints)
+        cur_counts, _ = np.histogram(cur, bins=breakpoints)
+
+        ref_pct = ref_counts / max(ref_counts.sum(), 1)
+        cur_pct = cur_counts / max(cur_counts.sum(), 1)
+
+        eps = 1e-6
+        ref_pct = np.where(ref_pct == 0, eps, ref_pct)
+        cur_pct = np.where(cur_pct == 0, eps, cur_pct)
+
+        psi = np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct))
+        return float(psi)
+
+    except Exception:
+        return 0.0
+
+# Collect ground truth from outputs/predictions/ and match against labels in inference_v1.csv
 def collect_ground_truth_fn(**context):
-    """
-    Loads stored predictions from outputs/predictions/ and matches
-    them against available ground truth labels.
-    Covers the last ROLLING_WINDOW_WEEKS weeks.
-    Pushes matched data to XCom for MAE computation.
-    """
-    import json
     import pandas as pd
     from pathlib import Path
 
     PRED_DIR   = PROJECT_ROOT / "outputs" / "predictions"
     SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
 
-    # Load all available weekly prediction files
+    logical_date = context["logical_date"]
+    cutoff_year, cutoff_week, _ = logical_date.isocalendar()
+    cutoff_year_week = f"{cutoff_year}-W{cutoff_week:02d}"
+
     pred_files = sorted(PRED_DIR.glob("*.csv"))
     if not pred_files:
         raise FileNotFoundError(
@@ -82,39 +118,42 @@ def collect_ground_truth_fn(**context):
             "Run the inference_pipeline DAG first."
         )
 
-    # Take the most recent ROLLING_WINDOW_WEEKS weeks
-    recent_files = pred_files[-ROLLING_WINDOW_WEEKS:]
-    all_preds = pd.concat([pd.read_csv(f) for f in recent_files])
+    eligible_files = []
+    for f in pred_files:
+        week_str = f.stem 
+        if week_str <= cutoff_year_week:
+            eligible_files.append(f)
 
-    # Load ground truth labels from inference_v1
+    if not eligible_files:
+        raise FileNotFoundError(
+            f"No prediction files found at or before logical week {cutoff_year_week}."
+        )
+
+    recent_files = eligible_files[-ROLLING_WINDOW_WEEKS:]
+    all_preds = pd.concat([pd.read_csv(f) for f in recent_files], ignore_index=True)
+
     inference_data = pd.read_csv(SPLITS_DIR / "inference_v1.csv")
 
-    # Merge predictions with ground truth
     merged = all_preds.merge(
         inference_data[["uid", "year_week", "label_composite_score"]],
         on=["uid", "year_week"],
         how="inner",
     )
 
-    print(f"Collected ground truth for {ROLLING_WINDOW_WEEKS} weeks:")
-    print(f"  Predictions     : {len(all_preds)}")
-    print(f"  Matched w/ GT   : {len(merged)}")
-    print(f"  Weeks covered   : {merged['year_week'].unique().tolist()}")
+    print(f"Logical monitoring week : {cutoff_year_week}")
+    print(f"Eligible prediction files: {len(eligible_files)}")
+    print(f"Using recent files      : {[f.stem for f in recent_files]}")
+    print(f"Predictions             : {len(all_preds)}")
+    print(f"Matched w/ GT           : {len(merged)}")
+    print(f"Weeks covered           : {merged['year_week'].unique().tolist()}")
 
     context["ti"].xcom_push(
         key="matched_data",
         value=merged.to_json(orient="records")
     )
 
-
-# ── Task 2: Compute rolling MAE ────────────────────────────────────────────────
-
+# Compute rolling MAE and compare to training baseline
 def compute_rolling_mae_fn(**context):
-    """
-    Computes rolling MAE across the collected ground truth window.
-    Retrieves the training baseline MAE from MLflow.
-    Determines whether the rolling MAE exceeds the alert threshold.
-    """
     import json
     import pandas as pd
     import mlflow
@@ -126,7 +165,6 @@ def compute_rolling_mae_fn(**context):
     )
     matched = pd.read_json(matched_json)
 
-    # Compute rolling MAE
     rolling_mae = mean_absolute_error(
         matched["label_composite_score"],
         matched["predicted_score"],
@@ -157,46 +195,99 @@ def compute_rolling_mae_fn(**context):
     ti.xcom_push(key="threshold",    value=float(threshold))
     ti.xcom_push(key="drift",        value=bool(rolling_mae > threshold))
 
+# Compute feature drift using PSI and compare to thresholds
+def compute_feature_drift_fn(**context):
+    import pandas as pd
+    from pathlib import Path
 
-# ── Task 3: Confirm drift ──────────────────────────────────────────────────────
+    SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
+    MONITOR_DIR = PROJECT_ROOT / "outputs" / "reports" / "monitoring"
+    MONITOR_DIR.mkdir(parents=True, exist_ok=True)
 
+    logical_date = context["logical_date"]
+    cutoff_year, cutoff_week, _ = logical_date.isocalendar()
+    cutoff_year_week = f"{cutoff_year}-W{cutoff_week:02d}"
+
+    reference_df = pd.read_csv(SPLITS_DIR / "pre_covid_test.csv")
+    current_df = pd.read_csv(SPLITS_DIR / "inference_v1.csv")
+
+    eligible_weeks = sorted(
+        w for w in current_df["year_week"].dropna().unique()
+        if w <= cutoff_year_week
+    )
+
+    if not eligible_weeks:
+        raise FileNotFoundError(
+            f"No inference_v1 weeks found at or before {cutoff_year_week}."
+        )
+
+    recent_weeks = eligible_weeks[-ROLLING_WINDOW_WEEKS:]
+    current_window = current_df[current_df["year_week"].isin(recent_weeks)].copy()
+
+    feature_cols = [
+        c for c in reference_df.columns
+        if c not in {"uid", "year_week", "label_composite_score"}
+    ]
+
+    psi_rows = []
+    for col in feature_cols:
+        psi = _compute_psi(reference_df[col], current_window[col])
+        psi_rows.append({"feature": col, "psi": psi})
+
+    psi_df = pd.DataFrame(psi_rows).sort_values("psi", ascending=False)
+    max_psi = float(psi_df["psi"].max()) if not psi_df.empty else 0.0
+    n_drifted_features = int((psi_df["psi"] > PSI_MODERATE_THRESHOLD).sum())
+    psi_triggered_drift = bool(
+        (max_psi > PSI_SEVERE_THRESHOLD) or (n_drifted_features >= MIN_DRIFTED_FEATURES)
+    )
+
+    report_path = MONITOR_DIR / f"feature_drift_{cutoff_year_week}.csv"
+    psi_df.to_csv(report_path, index=False)
+
+    print(f"Reference split        : pre_covid_test.csv")
+    print(f"Current logical week   : {cutoff_year_week}")
+    print(f"Current weeks used     : {recent_weeks}")
+    print(f"Max PSI                : {max_psi:.4f}")
+    print(f"Drifted features >0.2  : {n_drifted_features}")
+    print(f"PSI-triggered drift    : {psi_triggered_drift}")
+    print(f"Saved report to        : {report_path}")
+
+    context["ti"].xcom_push(key="max_psi", value=max_psi)
+    context["ti"].xcom_push(key="n_drifted_features", value=n_drifted_features)
+    context["ti"].xcom_push(key="psi_triggered_drift", value=psi_triggered_drift)
+
+# Confirm drift and proceed to retraining if sustained
 def confirm_drift_fn(**context):
-    """
-    Branch task — only proceeds to retraining if drift is confirmed.
-    In Phase 5 simulation: always proceeds (DAG is triggered when drift
-    is already known). In production: provides a safety check to avoid
-    retraining on transient spikes.
-    """
     ti = context["ti"]
-    drift = ti.xcom_pull(task_ids="compute_rolling_mae", key="drift")
-    rolling_mae = ti.xcom_pull(task_ids="compute_rolling_mae", key="rolling_mae")
-    threshold   = ti.xcom_pull(task_ids="compute_rolling_mae", key="threshold")
 
-    if drift:
-        print(f"DRIFT CONFIRMED: rolling MAE {rolling_mae:.4f} > threshold {threshold:.4f}")
-        print("Proceeding to v2 retraining.")
+    mae_drift = ti.xcom_pull(task_ids="compute_rolling_mae", key="drift")
+    rolling_mae = ti.xcom_pull(task_ids="compute_rolling_mae", key="rolling_mae")
+    threshold = ti.xcom_pull(task_ids="compute_rolling_mae", key="threshold")
+
+    max_psi = ti.xcom_pull(task_ids="compute_feature_drift", key="max_psi")
+    n_drifted_features = ti.xcom_pull(
+        task_ids="compute_feature_drift", key="n_drifted_features"
+    )
+    psi_drift = ti.xcom_pull(
+        task_ids="compute_feature_drift", key="psi_triggered_drift"
+    )
+
+    print(f"MAE drift            : {mae_drift}")
+    print(f"Rolling MAE          : {rolling_mae:.4f}")
+    print(f"MAE threshold        : {threshold:.4f}")
+    print(f"Max PSI              : {float(max_psi):.4f}")
+    print(f"Drifted features     : {int(n_drifted_features)}")
+    print(f"PSI drift            : {psi_drift}")
+
+    if mae_drift or psi_drift:
+        print("DRIFT CONFIRMED: retraining will start.")
         return "retrain_v2"
     else:
-        print(f"No drift: rolling MAE {rolling_mae:.4f} <= threshold {threshold:.4f}")
-        print("Skipping retraining.")
+        print("No sustained drift detected.")
         return "no_drift_detected"
 
-
-# ── Task 4: Retrain v2 ────────────────────────────────────────────────────────
-
+# Retrain v2 with COVID features, register if improved
 def retrain_v2_fn(**context):
-    """
-    Trains v2 LightGBM on ALL_FEATURES (sensing + COVID features).
-    Calls train_lightgbm_v2 with register=True — this is the ONLY
-    place in the entire codebase where v2 gets registered.
-
-    The MLflow audit trail shows:
-      - Run started by: monitoring_pipeline DAG (not a human)
-      - Registered by: automated trigger (not manual)
-      - Timestamp: after drift detection event
-
-    This is what makes the MLOps demonstration authentic.
-    """
     import mlflow
     from src.models.train_v2 import train_lightgbm_v2
 
@@ -216,7 +307,7 @@ def retrain_v2_fn(**context):
         learning_rate=0.05,
         min_child_samples=10,
         run_name="v2_monitoring_retrain",
-        register=True,          # ← Only True here, never in notebooks
+        register=True,          
     )
 
     print(f"v2 training complete:")
@@ -228,15 +319,8 @@ def retrain_v2_fn(**context):
     context["ti"].xcom_push(key="v2_test_mae", value=metrics["test_mae"])
     context["ti"].xcom_push(key="v2_val_r2",   value=metrics["val_r2"])
 
-
-# ── Task 5: Evaluate new model ─────────────────────────────────────────────────
-
+# Evaluate both models on full_test and decide whether to promote v2
 def evaluate_new_model_fn(**context):
-    """
-    Evaluates both v1 and v2 on full_test (COVID-period held-out data).
-    Determines whether v2 should replace v1 in production.
-    Branches to promote_v2 or keep_v1.
-    """
     import mlflow
     import mlflow.lightgbm
     import pandas as pd
@@ -248,7 +332,6 @@ def evaluate_new_model_fn(**context):
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
-    # Load full_test
     SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
     full_test = pd.read_csv(SPLITS_DIR / "full_test.csv")
     y_test = full_test[TARGET]
@@ -280,25 +363,15 @@ def evaluate_new_model_fn(**context):
     ti.xcom_push(key="improvement",  value=float(improvement))
 
     if v2_covid_mae < v1_covid_mae:
-        print("v2 outperforms v1 — proceeding to promotion.")
+        print("v2 outperforms v1 - proceeding to promotion.")
         return "promote_v2"
     else:
-        print("v2 does not outperform v1 — keeping current production model.")
+        print("v2 does not outperform v1 - keeping current production model.")
         return "keep_v1"
 
-
-# ── Task 6a: Promote v2 ────────────────────────────────────────────────────────
-
+# Promote v2 to production, demote v1 to archived
+# Maybe also trigger Kubernetes deployment update (not implemented here)
 def promote_v2_fn(**context):
-    """
-    Sets v2 @production alias. From this point all inference requests
-    are served by v2. The Kubernetes rolling update handles the
-    container transition without downtime.
-
-    Note: in a full implementation this task would also trigger a
-    Kubernetes deployment update. For the demonstration the alias
-    change is sufficient — the API reads the alias on each startup.
-    """
     import mlflow
 
     ti = context["ti"]
@@ -308,7 +381,7 @@ def promote_v2_fn(**context):
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = mlflow.tracking.MlflowClient()
 
-    # Archive v1 production version
+    # Archive v1
     try:
         v1_prod = client.get_model_version_by_alias(V1_MODEL_NAME, "production")
         client.delete_registered_model_alias(V1_MODEL_NAME, "production")
@@ -316,46 +389,58 @@ def promote_v2_fn(**context):
     except Exception as e:
         print(f"Could not archive v1: {e}")
 
-    # v2 is already @production from retrain_v2 task
+    # v2 is already @production from retrain_v2
     print(f"v2 is now @production.")
     print(f"  v1 COVID-period MAE : {v1_mae:.4f}")
     print(f"  v2 COVID-period MAE : {v2_mae:.4f}")
     print(f"  Improvement         : {v1_mae - v2_mae:.4f}")
     print("Grafana will show MAE recovery from this point.")
 
-
-# ── Task 7: Notify / log outcome ──────────────────────────────────────────────
-
+# Log outcome 
+# and notify stakeholders with email (not implemented here)
 def notify_fn(**context):
-    """
-    Logs the monitoring event outcome to MLflow.
-    In production this would also send a Slack/email notification.
-    """
     import mlflow
 
     ti = context["ti"]
     rolling_mae = ti.xcom_pull(task_ids="compute_rolling_mae", key="rolling_mae")
     baseline_mae = ti.xcom_pull(task_ids="compute_rolling_mae", key="baseline_mae")
-    v2_test_mae  = ti.xcom_pull(task_ids="retrain_v2", key="v2_test_mae")
+    v2_test_mae = ti.xcom_pull(task_ids="retrain_v2", key="v2_test_mae")
+    branch_taken = ti.xcom_pull(task_ids="confirm_drift")
+
+    max_psi = ti.xcom_pull(task_ids="compute_feature_drift", key="max_psi")
+    n_drifted_features = ti.xcom_pull(
+        task_ids="compute_feature_drift", key="n_drifted_features"
+    )
+    psi_triggered_drift = ti.xcom_pull(
+        task_ids="compute_feature_drift", key="psi_triggered_drift"
+    )
+    mae_triggered_drift = ti.xcom_pull(task_ids="compute_rolling_mae", key="drift")
+
+    if branch_taken == "retrain_v2":
+        event_type = "drift_detected_and_retrained"
+    else:
+        event_type = "no_drift_detected"
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
     with mlflow.start_run(run_name="monitoring_event"):
         mlflow.log_metrics({
-            "drift_rolling_mae":        float(rolling_mae) if rolling_mae else 0,
-            "v1_baseline_mae":          float(baseline_mae) if baseline_mae else 0,
-            "v2_test_mae_post_retrain": float(v2_test_mae) if v2_test_mae else 0,
+            "drift_rolling_mae": float(rolling_mae) if rolling_mae else 0.0,
+            "v1_baseline_mae": float(baseline_mae) if baseline_mae else 0.0,
+            "v2_test_mae_post_retrain": float(v2_test_mae) if v2_test_mae else 0.0,
+            "max_psi": float(max_psi) if max_psi else 0.0,
+            "n_drifted_features": float(n_drifted_features) if n_drifted_features else 0.0,
         })
-        mlflow.set_tag("event_type",  "drift_detected_and_retrained")
-        mlflow.set_tag("pipeline",    "monitoring_pipeline")
-        mlflow.set_tag("dag_run_id",  context["run_id"])
+        mlflow.set_tag("event_type", event_type)
+        mlflow.set_tag("pipeline", "monitoring_pipeline")
+        mlflow.set_tag("dag_run_id", context["run_id"])
+        mlflow.set_tag("mae_triggered_drift", str(bool(mae_triggered_drift)))
+        mlflow.set_tag("psi_triggered_drift", str(bool(psi_triggered_drift)))
 
     print("Monitoring event logged to MLflow.")
-    print("Phase 5 Grafana dashboard will show the recovery.")
 
-
-# ── Define tasks ──────────────────────────────────────────────────────────────
+# Tasks
 
 t1_collect = PythonOperator(
     task_id="collect_ground_truth",
@@ -366,6 +451,12 @@ t1_collect = PythonOperator(
 t2_mae = PythonOperator(
     task_id="compute_rolling_mae",
     python_callable=compute_rolling_mae_fn,
+    dag=dag,
+)
+
+t2b_feature_drift = PythonOperator(
+    task_id="compute_feature_drift",
+    python_callable=compute_feature_drift_fn,
     dag=dag,
 )
 
@@ -410,9 +501,10 @@ t8_notify = PythonOperator(
     dag=dag,
 )
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
-
-t1_collect >> t2_mae >> t3_confirm
+# Dependencies
+t1_collect >> t2_mae
+t1_collect >> t2b_feature_drift
+[t2_mae, t2b_feature_drift] >> t3_confirm
 t3_confirm >> [t4_retrain, t7_no_drift]
 t4_retrain >> t5_evaluate
 t5_evaluate >> [t6a_promote, t6b_keep]
