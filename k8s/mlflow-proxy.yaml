@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow-proxy
+  template:
+    metadata:
+      labels:
+        app: mlflow-proxy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: socat
+          image: alpine/socat
+          args:
+            - "TCP-LISTEN:5000,fork,reuseaddr"
+            - "TCP:host.minikube.internal:5000"
+          ports:
+            - containerPort: 5000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-proxy
+spec:
+  selector:
+    app: mlflow-proxy
+  ports:
+    - protocol: TCP
+      port: 5000
+      targetPort: 5000
+  type: ClusterIP

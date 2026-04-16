@@ -289,14 +289,16 @@ def confirm_drift_fn(**context):
 # Retrain v2 with COVID features, register if improved
 def retrain_v2_fn(**context):
     import mlflow
+    from mlflow.tracking import MlflowClient
     from src.models.train_v2 import train_lightgbm_v2
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
+    client = MlflowClient()
 
-    rolling_mae = context["ti"].xcom_pull(
-        task_ids="compute_rolling_mae", key="rolling_mae"
-    )
+    ti = context["ti"]
+    rolling_mae = ti.xcom_pull(task_ids="compute_rolling_mae", key="rolling_mae")
+
     print(f"Retraining triggered by drift: rolling_mae={rolling_mae:.4f}")
     print("Training v2 with COVID features (register=True)...")
 
@@ -307,17 +309,38 @@ def retrain_v2_fn(**context):
         learning_rate=0.05,
         min_child_samples=10,
         run_name="v2_monitoring_retrain",
-        register=True,          
+        register=True,
     )
 
-    print(f"v2 training complete:")
+    latest_v2 = client.search_model_versions(f"name='{V2_MODEL_NAME}'")
+    if not latest_v2:
+        raise RuntimeError(f"No registered versions found for {V2_MODEL_NAME}")
+
+    candidate_version = max(latest_v2, key=lambda mv: int(mv.version))
+
+    try:
+        old_candidate = client.get_model_version_by_alias(V2_MODEL_NAME, "candidate")
+        client.delete_registered_model_alias(V2_MODEL_NAME, "candidate")
+        print(f"Removed old candidate alias from v{old_candidate.version}")
+    except Exception:
+        pass
+
+    client.set_registered_model_alias(
+        name=V2_MODEL_NAME,
+        alias="candidate",
+        version=candidate_version.version,
+    )
+
+    print("v2 training complete:")
     print(f"  val MAE  : {metrics['val_mae']:.4f}")
     print(f"  test MAE : {metrics['test_mae']:.4f}")
     print(f"  val R2   : {metrics['val_r2']:.4f}")
+    print(f"  candidate version: {candidate_version.version}")
 
-    context["ti"].xcom_push(key="v2_val_mae",  value=metrics["val_mae"])
-    context["ti"].xcom_push(key="v2_test_mae", value=metrics["test_mae"])
-    context["ti"].xcom_push(key="v2_val_r2",   value=metrics["val_r2"])
+    ti.xcom_push(key="v2_val_mae", value=float(metrics["val_mae"]))
+    ti.xcom_push(key="v2_test_mae", value=float(metrics["test_mae"]))
+    ti.xcom_push(key="v2_val_r2", value=float(metrics["val_r2"]))
+    ti.xcom_push(key="candidate_version", value=str(candidate_version.version))
 
 # Evaluate both models on full_test and decide whether to promote v2
 def evaluate_new_model_fn(**context):
@@ -329,72 +352,100 @@ def evaluate_new_model_fn(**context):
     from src.features.feature_columns import SENSING_FEATURES, ALL_FEATURES, TARGET
 
     ti = context["ti"]
-
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
-    SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
-    full_test = pd.read_csv(SPLITS_DIR / "full_test.csv")
+    splits_dir = PROJECT_ROOT / "data" / "processed" / "splits"
+    full_test = pd.read_csv(splits_dir / "full_test.csv")
     y_test = full_test[TARGET]
 
-    # Evaluate v1 on COVID-period data (sensing only)
     v1_model = mlflow.lightgbm.load_model(
         f"models:/{V1_MODEL_NAME}@production"
     )
     preds_v1 = v1_model.predict(full_test[SENSING_FEATURES])
     v1_covid_mae = mean_absolute_error(y_test, preds_v1)
 
-    # Evaluate v2 on COVID-period data (all features)
     v2_model = mlflow.lightgbm.load_model(
-        f"models:/{V2_MODEL_NAME}@production"
+        f"models:/{V2_MODEL_NAME}@candidate"
     )
     preds_v2 = v2_model.predict(full_test[ALL_FEATURES])
     v2_covid_mae = mean_absolute_error(y_test, preds_v2)
 
     improvement = v1_covid_mae - v2_covid_mae
-    improvement_pct = improvement / v1_covid_mae * 100
+    improvement_pct = (improvement / v1_covid_mae * 100.0) if v1_covid_mae != 0 else 0.0
 
-    print(f"Evaluation on full_test (COVID period):")
-    print(f"  v1 MAE : {v1_covid_mae:.4f}")
-    print(f"  v2 MAE : {v2_covid_mae:.4f}")
-    print(f"  Improvement: {improvement:.4f} ({improvement_pct:.1f}%)")
+    print("Evaluation on full_test (COVID period):")
+    print(f"  current production v1 MAE : {v1_covid_mae:.4f}")
+    print(f"  candidate v2 MAE          : {v2_covid_mae:.4f}")
+    print(f"  Improvement               : {improvement:.4f} ({improvement_pct:.1f}%)")
 
     ti.xcom_push(key="v1_covid_mae", value=float(v1_covid_mae))
     ti.xcom_push(key="v2_covid_mae", value=float(v2_covid_mae))
-    ti.xcom_push(key="improvement",  value=float(improvement))
+    ti.xcom_push(key="improvement", value=float(improvement))
 
     if v2_covid_mae < v1_covid_mae:
-        print("v2 outperforms v1 - proceeding to promotion.")
+        print("Candidate v2 outperforms current production v1 - proceeding to promotion.")
         return "promote_v2"
     else:
-        print("v2 does not outperform v1 - keeping current production model.")
+        print("Candidate v2 does not outperform current production v1 - keeping v1 in production.")
         return "keep_v1"
 
 # Promote v2 to production, demote v1 to archived
 # Maybe also trigger Kubernetes deployment update (not implemented here)
 def promote_v2_fn(**context):
     import mlflow
+    from mlflow.tracking import MlflowClient
 
     ti = context["ti"]
     v1_mae = ti.xcom_pull(task_ids="evaluate_new_model", key="v1_covid_mae")
     v2_mae = ti.xcom_pull(task_ids="evaluate_new_model", key="v2_covid_mae")
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    client = mlflow.tracking.MlflowClient()
+    client = MlflowClient()
 
-    # Archive v1
     try:
         v1_prod = client.get_model_version_by_alias(V1_MODEL_NAME, "production")
         client.delete_registered_model_alias(V1_MODEL_NAME, "production")
-        print(f"Archived v1 @production (was version {v1_prod.version})")
+        client.set_registered_model_alias(V1_MODEL_NAME, "archived", v1_prod.version)
+        print(f"Archived v1 production version {v1_prod.version}")
     except Exception as e:
-        print(f"Could not archive v1: {e}")
+        raise RuntimeError(f"Could not archive v1 production: {e}")
 
-    # v2 is already @production from retrain_v2
-    print(f"v2 is now @production.")
+    try:
+        v2_candidate = client.get_model_version_by_alias(V2_MODEL_NAME, "candidate")
+    except Exception as e:
+        raise RuntimeError(f"Could not find v2 candidate: {e}")
+
+    client.set_registered_model_alias(
+        name=V2_MODEL_NAME,
+        alias="production",
+        version=v2_candidate.version,
+    )
+
+    try:
+        client.delete_registered_model_alias(V2_MODEL_NAME, "candidate")
+    except Exception:
+        pass
+
+    print(f"Promoted v2 version {v2_candidate.version} to @production")
     print(f"  v1 COVID-period MAE : {v1_mae:.4f}")
     print(f"  v2 COVID-period MAE : {v2_mae:.4f}")
     print(f"  Improvement         : {v1_mae - v2_mae:.4f}")
-    print("Grafana will show MAE recovery from this point.")
+    print("Grafana will show recovery after this production switch.")
+
+def keep_v1_fn(**context):
+    import mlflow
+    from mlflow.tracking import MlflowClient
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    client = MlflowClient()
+
+    try:
+        v2_candidate = client.get_model_version_by_alias(V2_MODEL_NAME, "candidate")
+        client.delete_registered_model_alias(V2_MODEL_NAME, "candidate")
+        client.set_registered_model_alias(V2_MODEL_NAME, "rejected", v2_candidate.version)
+        print(f"Candidate v2 version {v2_candidate.version} rejected; v1 remains production.")
+    except Exception:
+        print("No candidate alias found to clean up. Keeping v1 in production.")
 
 # Log outcome 
 # and notify stakeholders with email (not implemented here)
@@ -484,8 +535,9 @@ t6a_promote = PythonOperator(
     dag=dag,
 )
 
-t6b_keep = EmptyOperator(
+t6b_keep = PythonOperator(
     task_id="keep_v1",
+    python_callable=keep_v1_fn,
     dag=dag,
 )
 

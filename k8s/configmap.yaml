@@ -4,7 +4,7 @@ metadata:
   name: mlops-config
   namespace: default
 data:
-  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
-  MODEL_NAME: "mental_health_v1"
+  MLFLOW_TRACKING_URI: "http://mlflow-proxy:5000"
+  MODEL_NAME: "mental_health_v2"
   MODEL_ALIAS: "production"
   PROMETHEUS_MULTIPROC_DIR: "/tmp/prometheus_multiproc"

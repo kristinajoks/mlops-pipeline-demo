@@ -52,7 +52,7 @@ services:
     image: python:3.12-slim
     container_name: mlflow_server
     command: >
-      sh -c "pip install -q mlflow && cd /mlflow && mlflow server --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root file:///mlflow/mlartifacts --host 0.0.0.0 --port 5000 --serve-artifacts --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000"
+      sh -c "pip install -q mlflow && cd /mlflow && mlflow server --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root file:///mlflow/mlartifacts --host 0.0.0.0 --port 5000 --serve-artifacts --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000,host.minikube.internal,host.minikube.internal:5000,host.docker.internal,host.docker.internal:5000,mlflow-proxy,mlflow-proxy:5000"
     ports:
       - "5000:5000"
     volumes:

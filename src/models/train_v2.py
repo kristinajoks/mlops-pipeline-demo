@@ -142,14 +142,8 @@ def train_lightgbm_v2(
 
     # Registration — only when called by retraining phase
     if register:
-        client = mlflow.tracking.MlflowClient()
         model_uri = f"runs:/{run_id}/model"
         registered = mlflow.register_model(model_uri, "mental_health_v2")
-        client.set_registered_model_alias(
-            name="mental_health_v2",
-            alias="production",
-            version=registered.version,
-        )
-        print(f"Registered: mental_health_v2 v{registered.version} @production")
+        print(f"Registered: mental_health_v2 v{registered.version}")
 
     return model, metrics
